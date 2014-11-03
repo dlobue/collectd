@@ -48,21 +48,8 @@ struct wb_callback_s
 
         char *user;
         char *pass;
-        char *credentials;
-        _Bool verify_peer;
-        _Bool verify_host;
-        char *cacert;
-        char *capath;
-        char *clientkey;
-        char *clientcert;
-        char *clientkeypass;
-        long sslversion;
-
-        _Bool store_rates;
-
-#define WH_FORMAT_COMMAND 0
+        char *tenantid;
 #define WH_FORMAT_JSON    1
-        int format;
 
         CURL *curl;
         char curl_errbuf[CURL_ERROR_SIZE];
@@ -77,6 +64,235 @@ struct wb_callback_s
 };
 typedef struct wb_callback_s wb_callback_t;
 
+#define MAX_DATA_TYPES  3
+#define MAX_OFFSET      100
+static int wb_json_escape_string (char *buffer, size_t buffer_size, /* {{{ */
+                const char *string)
+{
+        size_t src_pos;
+        size_t dst_pos;
+
+        if ((buffer == NULL) || (string == NULL))
+                return (-EINVAL);
+
+        if (buffer_size < 3)
+                return (-ENOMEM);
+
+        dst_pos = 0;
+
+#define BUFFER_ADD(c) do { \
+        if (dst_pos >= (buffer_size - 1)) { \
+                buffer[buffer_size - 1] = 0; \
+                return (-ENOMEM); \
+        } \
+        buffer[dst_pos] = (c); \
+        dst_pos++; } while (0)
+
+        /* Escape special characters */
+        BUFFER_ADD ('"');
+        for (src_pos = 0; string[src_pos] != 0; src_pos++)
+        {
+                if ((string[src_pos] == '"')
+                                || (string[src_pos] == '\\'))
+                {
+                        BUFFER_ADD ('\\');
+                        BUFFER_ADD (string[src_pos]);
+                }
+                else if (string[src_pos] <= 0x001F)
+                        BUFFER_ADD ('?');
+                else
+                        BUFFER_ADD (string[src_pos]);
+        } /* for */
+        BUFFER_ADD ('"');
+        buffer[dst_pos] = 0;
+
+#undef BUFFER_ADD
+
+        return (0);
+} /* }}} int wb_json_escape_string */
+
+ static int wb_value_list_to_json (char *buffer, size_t buffer_size, /* {{{ */
+                const data_set_t *ds, const value_list_t *vl, const char *tenantid)
+{
+        size_t offset = 0;
+        char temp[512] = {0};
+        char name_buffer[5 * DATA_MAX_NAME_LEN];
+        int status;
+        int store[MAX_DATA_TYPES][MAX_OFFSET]; 
+        int gauge_offset = 0;
+        int counter_offset = 0;
+        int absolute_offset = 0;
+        gauge_t *rates = NULL;
+        int i;
+
+        memset (buffer, 0, buffer_size);
+
+#define BUFFER_ADD(...) do { \
+        status = ssnprintf (buffer + offset, buffer_size - offset, \
+                        __VA_ARGS__); \
+        if (status < 1) \
+        return (-1); \
+        else if (((size_t) status) >= (buffer_size - offset)) \
+        return (-ENOMEM); \
+        else \
+        offset += ((size_t) status); } while (0)
+
+#define BUFFER_ADD_KEYVAL(key, value) do { \
+        status = wb_json_escape_string (temp, sizeof (temp), (value)); \
+        if (status != 0) \
+        return (status); \
+        BUFFER_ADD ("\"%s\":%s,", (key), temp); } while (0)
+
+        /* All value lists have a leading comma. The first one will be replaced with
+         * a square bracket in `format_json_finalize'. */
+        for (i = 0; i < ds->ds_num; i++)
+        {
+                if (ds->ds[i].type == DS_TYPE_GAUGE)
+                {		
+                        store[0][gauge_offset] = i;
+                        gauge_offset++;
+                }
+                else if (ds->ds[i].type == DS_TYPE_COUNTER) 
+                {
+                        store[1][counter_offset] = i;
+                        counter_offset++;
+                }
+                else if (ds->ds[i].type == DS_TYPE_DERIVE) 
+                {
+                        DEBUG ("Skipping derive data type for now");
+                }
+                else if (ds->ds[i].type == DS_TYPE_ABSOLUTE) 
+                {
+                        store[2][absolute_offset] = i;
+                        absolute_offset++;
+                }
+                else
+                {
+                        ERROR ("format_json: Unknown data source type: %i",
+                                        ds->ds[i].type);
+                        sfree (rates);
+                        return (-1);
+                }
+        } /* for ds->ds_num */
+
+        // don't add anything to buffer if we don't have any data.
+        if (gauge_offset == 0 && counter_offset == 0 && absolute_offset == 0)
+                return 0;
+
+        BUFFER_ADD ("{");
+        if (counter_offset > 0) 
+        {
+                BUFFER_ADD ("\"counters\":[");
+                for (i = 0; i < counter_offset; i++) {
+                        INFO ("ADDING COUNTER TO BUFFER"); // TODO These debug statements need to be removed during cleanup
+                        BUFFER_ADD ("{");
+                        format_name(name_buffer, sizeof (name_buffer),
+                                        vl->host, vl->plugin, vl->plugin_instance,
+                                        vl->type, vl->type_instance);
+                        BUFFER_ADD_KEYVAL ("name", name_buffer);
+                        BUFFER_ADD ("\"value\":%llu", vl->values[store[1][i]].counter);
+                        BUFFER_ADD ("},");
+                }
+                offset--;
+                BUFFER_ADD ("],");
+                INFO ("format_json: value_list_to_json: buffer = %s;", buffer);
+        }
+
+        if (gauge_offset > 0) 
+        {
+                INFO ("format_json: value_list_to_json: buffer = %s;", buffer);
+                BUFFER_ADD ("\"gauges\":[");
+                for (i = 0; i < gauge_offset; i++) 
+                {
+                        INFO ("ADDED GAUGE as %s, metric value as %g", vl->plugin, vl->values[store[0][i]].gauge);
+                        BUFFER_ADD ("{");
+                        format_name(name_buffer, sizeof (name_buffer),
+                                        vl->host, vl->plugin, vl->plugin_instance,
+                                        vl->type, vl->type_instance);
+                        BUFFER_ADD_KEYVAL ("name", name_buffer);
+                        if(isfinite (vl->values[store[0][i]].gauge)) 
+                        {
+                                BUFFER_ADD ("\"value\":%g", vl->values[store[0][i]].gauge);
+                        }
+                        else 
+                        {
+                                BUFFER_ADD ("\"value\":null");
+                        }
+                        BUFFER_ADD ("},");
+                }
+                offset--;
+                BUFFER_ADD ("],");
+                INFO ("format_json: value_list_to_json: buffer = %s;", buffer);
+        }
+
+        if (absolute_offset > 0) 
+        {
+                INFO ("format_json: value_list_to_json: buffer = %s;", buffer);
+                BUFFER_ADD ("\"gauges\":[");
+                for (i = 0; i < absolute_offset; i++) {
+                        INFO ("ADDING ABSOLUTE tO BUFFER");
+                        BUFFER_ADD ("{");
+                        format_name(name_buffer, sizeof (name_buffer),
+                                        vl->host, vl->plugin, vl->plugin_instance,
+                                        vl->type, vl->type_instance);
+                        BUFFER_ADD_KEYVAL ("name", name_buffer);
+                        BUFFER_ADD ("\"value\":%"PRIu64"},", vl->values[store[2][i]].absolute);
+                        BUFFER_ADD ("},");
+                }
+                offset--;
+                BUFFER_ADD ("],");
+                INFO ("format_json: value_list_to_json: buffer = %s;", buffer);
+        }
+
+        BUFFER_ADD("\"tenantId\":\"%s\",",tenantid);
+        BUFFER_ADD ("\"timestamp\":%lu,", CDTIME_T_TO_MS (vl->time));
+        BUFFER_ADD ("\"flushInterval\":%lu", CDTIME_T_TO_MS (vl->interval));
+        BUFFER_ADD ("}");
+#undef BUFFER_ADD
+#undef BUFFER_ADD_KEYVAL
+
+        DEBUG ("format_json: value_list_to_json: buffer = %s;", buffer);
+
+        return (0);
+} /* }}} int wb_value_list_to_json */
+
+static int wb_format_json_value_list_nocheck (char *buffer, /* {{{ */
+                size_t *ret_buffer_fill, size_t *ret_buffer_free,
+                const data_set_t *ds, const value_list_t *vl,
+                size_t temp_size, const char *tenantid)
+{
+        char temp[temp_size];
+        int status;
+
+        status = wb_value_list_to_json (temp, sizeof (temp), ds, vl, tenantid);
+        if (status != 0)
+                return (status);
+        temp_size = strlen (temp);
+
+        memcpy (buffer + (*ret_buffer_fill), temp, temp_size + 1);
+        (*ret_buffer_fill) += temp_size;
+        (*ret_buffer_free) -= temp_size;
+
+        return (0);
+} /* }}} int format_json_value_list_nocheck */
+
+static int wb_format_json_value_list (char *buffer, /* {{{ */
+                size_t *ret_buffer_fill, size_t *ret_buffer_free,
+                const data_set_t *ds, const value_list_t *vl, const char *tenantid)
+{
+        if ((buffer == NULL)
+                        || (ret_buffer_fill == NULL) || (ret_buffer_free == NULL)
+                        || (ds == NULL) || (vl == NULL))
+                return (-EINVAL);
+
+        if (*ret_buffer_free < 3)
+                return (-ENOMEM);
+
+        return (wb_format_json_value_list_nocheck (buffer,
+                                ret_buffer_fill, ret_buffer_free, ds, vl,
+                                (*ret_buffer_free) - 2, tenantid));
+} /* }}} int format_json_value_list */
+
 static void wb_reset_buffer (wb_callback_t *cb)  /* {{{ */
 {
         memset (cb->send_buffer, 0, cb->send_buffer_size);
@@ -84,13 +300,32 @@ static void wb_reset_buffer (wb_callback_t *cb)  /* {{{ */
         cb->send_buffer_fill = 0;
         cb->send_buffer_init_time = cdtime ();
 
-        if (cb->format == WH_FORMAT_JSON)
-        {
-                format_json_initialize (cb->send_buffer,
-                                &cb->send_buffer_fill,
-                                &cb->send_buffer_free);
-        }
+        format_json_initialize (cb->send_buffer,
+                        &cb->send_buffer_fill,
+                        &cb->send_buffer_free);
 } /* }}} wb_reset_buffer */
+
+int wb_format_json_finalize (char *buffer, /* {{{ */
+                size_t *ret_buffer_fill, size_t *ret_buffer_free)
+{
+        size_t pos;
+
+        if ((buffer == NULL) || (ret_buffer_fill == NULL) || (ret_buffer_free == NULL))
+                return (-EINVAL);
+
+        if (*ret_buffer_free < 2)
+                return (-ENOMEM);
+
+        pos = *ret_buffer_fill;
+        buffer[pos] = 0;
+
+        INFO ("write_blueflood plugin: In finalize method %s", buffer);
+
+        (*ret_buffer_fill)++;
+        (*ret_buffer_free)--;
+
+        return (0);
+}  /* }}} int wb_format_json_finalize */
 
 static int wb_send_buffer (wb_callback_t *cb) /* {{{ */
 {
@@ -126,54 +361,12 @@ static int wb_callback_init (wb_callback_t *cb) /* {{{ */
 
         headers = NULL;
         headers = curl_slist_append (headers, "Accept:  */*");
-        if (cb->format == WH_FORMAT_JSON)
-                headers = curl_slist_append (headers, "Content-Type: application/json");
-        else
-                headers = curl_slist_append (headers, "Content-Type: text/plain");
+        headers = curl_slist_append (headers, "Content-Type: application/json");
         headers = curl_slist_append (headers, "Expect:");
         curl_easy_setopt (cb->curl, CURLOPT_HTTPHEADER, headers);
 
         curl_easy_setopt (cb->curl, CURLOPT_ERRORBUFFER, cb->curl_errbuf);
         curl_easy_setopt (cb->curl, CURLOPT_URL, cb->location);
-
-        if (cb->user != NULL)
-        {
-                size_t credentials_size;
-
-                credentials_size = strlen (cb->user) + 2;
-                if (cb->pass != NULL)
-                        credentials_size += strlen (cb->pass);
-
-                cb->credentials = (char *) malloc (credentials_size);
-                if (cb->credentials == NULL)
-                {
-                        ERROR ("curl plugin: malloc failed.");
-                        return (-1);
-                }
-
-                ssnprintf (cb->credentials, credentials_size, "%s:%s",
-                                cb->user, (cb->pass == NULL) ? "" : cb->pass);
-                curl_easy_setopt (cb->curl, CURLOPT_USERPWD, cb->credentials);
-                curl_easy_setopt (cb->curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
-        }
-
-        curl_easy_setopt (cb->curl, CURLOPT_SSL_VERIFYPEER, (long) cb->verify_peer);
-        curl_easy_setopt (cb->curl, CURLOPT_SSL_VERIFYHOST,
-                        cb->verify_host ? 2L : 0L);
-        curl_easy_setopt (cb->curl, CURLOPT_SSLVERSION, cb->sslversion);
-        if (cb->cacert != NULL)
-                curl_easy_setopt (cb->curl, CURLOPT_CAINFO, cb->cacert);
-        if (cb->capath != NULL)
-                curl_easy_setopt (cb->curl, CURLOPT_CAPATH, cb->capath);
-
-        if (cb->clientkey != NULL && cb->clientcert != NULL)
-        {
-            curl_easy_setopt (cb->curl, CURLOPT_SSLKEY, cb->clientkey);
-            curl_easy_setopt (cb->curl, CURLOPT_SSLCERT, cb->clientcert);
-
-            if (cb->clientkeypass != NULL)
-                curl_easy_setopt (cb->curl, CURLOPT_SSLKEYPASSWD, cb->clientkeypass);
-        }
 
         wb_reset_buffer (cb);
 
@@ -184,7 +377,7 @@ static int wb_flush_nolock (cdtime_t timeout, wb_callback_t *cb) /* {{{ */
 {
         int status;
 
-        DEBUG ("write_blueflood plugin: wh_flush_nolock: timeout = %.3f; "
+        DEBUG ("write_blueflood plugin: wb_flush_nolock: timeout = %.3f; "
                         "send_buffer_fill = %zu;",
                         CDTIME_T_TO_DOUBLE (timeout),
                         cb->send_buffer_fill);
@@ -199,46 +392,25 @@ static int wb_flush_nolock (cdtime_t timeout, wb_callback_t *cb) /* {{{ */
                         return (0);
         }
 
-        if (cb->format == WH_FORMAT_COMMAND)
+        if (cb->send_buffer_fill <= 2)
         {
-                if (cb->send_buffer_fill <= 0)
-                {
-                        cb->send_buffer_init_time = cdtime ();
-                        return (0);
-                }
+                cb->send_buffer_init_time = cdtime ();
+                return (0);
+        }
 
-                status = wb_send_buffer (cb);
+        status = wb_format_json_finalize (cb->send_buffer,
+                        &cb->send_buffer_fill,
+                        &cb->send_buffer_free);
+        if (status != 0)
+        {
+                ERROR ("write_blueflood: wb_flush_nolock: "
+                                "wb_format_json_finalize failed.");
                 wb_reset_buffer (cb);
+                return (status);
         }
-        else if (cb->format == WH_FORMAT_JSON)
-        {
-                if (cb->send_buffer_fill <= 2)
-                {
-                        cb->send_buffer_init_time = cdtime ();
-                        return (0);
-                }
 
-                status = format_json_finalize (cb->send_buffer,
-                                &cb->send_buffer_fill,
-                                &cb->send_buffer_free);
-                if (status != 0)
-                {
-                        ERROR ("write_blueflood: wh_flush_nolock: "
-                                        "format_json_finalize failed.");
-                        wb_reset_buffer (cb);
-                        return (status);
-                }
-
-                status = wb_send_buffer (cb);
-                wb_reset_buffer (cb);
-        }
-        else
-        {
-                ERROR ("write_blueflood: wh_flush_nolock: "
-                                "Unknown format: %i",
-                                cb->format);
-                return (-1);
-        }
+        status = wb_send_buffer (cb);
+        wb_reset_buffer (cb);
 
         return (status);
 } /* }}} wb_flush_nolock */
@@ -262,7 +434,7 @@ static int wb_flush (cdtime_t timeout, /* {{{ */
                 status = wb_callback_init (cb);
                 if (status != 0)
                 {
-                        ERROR ("write_blueflood plugin: wh_callback_init failed.");
+                        ERROR ("write_blueflood plugin: wb_callback_init failed.");
                         pthread_mutex_unlock (&cb->send_lock);
                         return (-1);
                 }
@@ -291,105 +463,13 @@ static void wb_callback_free (void *data) /* {{{ */
                 cb->curl = NULL;
         }
         sfree (cb->location);
+        sfree (cb->tenantid);
         sfree (cb->user);
         sfree (cb->pass);
-        sfree (cb->credentials);
-        sfree (cb->cacert);
-        sfree (cb->capath);
-        sfree (cb->clientkey);
-        sfree (cb->clientcert);
-        sfree (cb->clientkeypass);
         sfree (cb->send_buffer);
 
         sfree (cb);
 } /* }}} void wb_callback_free */
-
-static int wb_write_command (const data_set_t *ds, const value_list_t *vl, /* {{{ */
-                wb_callback_t *cb)
-{
-        char key[10*DATA_MAX_NAME_LEN];
-        char values[512];
-        char command[1024];
-        size_t command_len;
-
-        int status;
-
-        if (0 != strcmp (ds->type, vl->type)) {
-                ERROR ("write_blueflood plugin: DS type does not match "
-                                "value list type");
-                return -1;
-        }
-
-        /* Copy the identifier to `key' and escape it. */
-        status = FORMAT_VL (key, sizeof (key), vl);
-        if (status != 0) {
-                ERROR ("write_blueflood plugin: error with format_name");
-                return (status);
-        }
-        escape_string (key, sizeof (key));
-
-        /* Convert the values to an ASCII representation and put that into
-         * `values'. */
-        status = format_values (values, sizeof (values), ds, vl, cb->store_rates);
-        if (status != 0) {
-                ERROR ("write_blueflood plugin: error with "
-                                "wh_value_list_to_string");
-                return (status);
-        }
-
-        command_len = (size_t) ssnprintf (command, sizeof (command),
-                        "PUTVAL %s interval=%.3f %s\r\n",
-                        key,
-                        CDTIME_T_TO_DOUBLE (vl->interval),
-                        values);
-        if (command_len >= sizeof (command)) {
-                ERROR ("write_blueflood plugin: Command buffer too small: "
-                                "Need %zu bytes.", command_len + 1);
-                return (-1);
-        }
-
-        pthread_mutex_lock (&cb->send_lock);
-
-        if (cb->curl == NULL)
-        {
-                status = wb_callback_init (cb);
-                if (status != 0)
-                {
-                        ERROR ("write_blueflood plugin: wh_callback_init failed.");
-                        pthread_mutex_unlock (&cb->send_lock);
-                        return (-1);
-                }
-        }
-
-        if (command_len >= cb->send_buffer_free)
-        {
-                status = wb_flush_nolock (/* timeout = */ 0, cb);
-                if (status != 0)
-                {
-                        pthread_mutex_unlock (&cb->send_lock);
-                        return (status);
-                }
-        }
-        assert (command_len < cb->send_buffer_free);
-
-        /* `command_len + 1' because `command_len' does not include the
-         * trailing null byte. Neither does `send_buffer_fill'. */
-        memcpy (cb->send_buffer + cb->send_buffer_fill,
-                        command, command_len + 1);
-        cb->send_buffer_fill += command_len;
-        cb->send_buffer_free -= command_len;
-
-        DEBUG ("write_blueflood plugin: <%s> buffer %zu/%zu (%g%%) \"%s\"",
-                        cb->location,
-                        cb->send_buffer_fill, cb->send_buffer_size,
-                        100.0 * ((double) cb->send_buffer_fill) / ((double) cb->send_buffer_size),
-                        command);
-
-        /* Check if we have enough space for this command. */
-        pthread_mutex_unlock (&cb->send_lock);
-
-        return (0);
-} /* }}} int wb_write_command */
 
 static int wb_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ */
                 wb_callback_t *cb)
@@ -404,24 +484,21 @@ static int wb_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
                 status = wb_callback_init (cb);
                 if (status != 0)
                 {
-                        ERROR ("write_blueflood plugin: wh_callback_init failed.");
+                        ERROR ("write_blueflood plugin: wb_callback_init failed.");
                         pthread_mutex_unlock (&cb->send_lock);
                         return (-1);
                 }
         }
 
-        format_status = format_json_value_list (cb->send_buffer,
+        format_status = wb_format_json_value_list (cb->send_buffer,
                         &cb->send_buffer_fill,
                         &cb->send_buffer_free,
-                        ds, vl, cb->store_rates);
+                        ds, vl, cb->tenantid);
 
         if (format_status == (-ENOMEM))
         {
-                // this is now a real error condition, not a sign that we need
-                // to flush.
-
-                //TODO: ERROR!
-
+                ERROR("write_blueflood plugin: no memory available");
+                return -1;
         }
 
         if (cb->send_buffer_fill > 0) {
@@ -457,41 +534,10 @@ static int wb_write (const data_set_t *ds, const value_list_t *vl, /* {{{ */
 
         cb = user_data->data;
 
-        if (cb->format == WH_FORMAT_JSON)
-                status = wb_write_json (ds, vl, cb);
-        else
-                status = wb_write_command (ds, vl, cb);
+        status = wb_write_json (ds, vl, cb);
 
         return (status);
 } /* }}} int wb_write */
-
-static int config_set_format (wb_callback_t *cb, /* {{{ */
-                oconfig_item_t *ci)
-{
-        char *string;
-
-        if ((ci->values_num != 1)
-                        || (ci->values[0].type != OCONFIG_TYPE_STRING))
-        {
-                WARNING ("write_blueflood plugin: The `%s' config option "
-                                "needs exactly one string argument.", ci->key);
-                return (-1);
-        }
-
-        string = ci->values[0].value.string;
-        if (strcasecmp ("Command", string) == 0)
-                cb->format = WH_FORMAT_COMMAND;
-        else if (strcasecmp ("JSON", string) == 0)
-                cb->format = WH_FORMAT_JSON;
-        else
-        {
-                ERROR ("write_blueflood plugin: Invalid format string: %s",
-                                string);
-                return (-1);
-        }
-
-        return (0);
-} /* }}} int config_set_format */
 
 static int wb_config_url (oconfig_item_t *ci) /* {{{ */
 {
@@ -508,10 +554,6 @@ static int wb_config_url (oconfig_item_t *ci) /* {{{ */
                 return (-1);
         }
         memset (cb, 0, sizeof (*cb));
-        cb->verify_peer = 1;
-        cb->verify_host = 1;
-        cb->format = WH_FORMAT_COMMAND;
-        cb->sslversion = CURL_SSLVERSION_DEFAULT;
 
         pthread_mutex_init (&cb->send_lock, /* attr = */ NULL);
 
@@ -523,58 +565,12 @@ static int wb_config_url (oconfig_item_t *ci) /* {{{ */
         {
                 oconfig_item_t *child = ci->children + i;
 
-                if (strcasecmp ("User", child->key) == 0)
+                if(strcasecmp("TenantId",child->key) == 0)
+                        cf_util_get_string(child, &cb->tenantid);		
+                else if (strcasecmp ("User", child->key) == 0)
                         cf_util_get_string (child, &cb->user);
                 else if (strcasecmp ("Password", child->key) == 0)
                         cf_util_get_string (child, &cb->pass);
-                else if (strcasecmp ("VerifyPeer", child->key) == 0)
-                        cf_util_get_boolean (child, &cb->verify_peer);
-                else if (strcasecmp ("VerifyHost", child->key) == 0)
-                        cf_util_get_boolean (child, &cb->verify_host);
-                else if (strcasecmp ("CACert", child->key) == 0)
-                        cf_util_get_string (child, &cb->cacert);
-                else if (strcasecmp ("CAPath", child->key) == 0)
-                        cf_util_get_string (child, &cb->capath);
-                else if (strcasecmp ("ClientKey", child->key) == 0)
-                        cf_util_get_string (child, &cb->clientkey);
-                else if (strcasecmp ("ClientCert", child->key) == 0)
-                        cf_util_get_string (child, &cb->clientcert);
-                else if (strcasecmp ("ClientKeyPass", child->key) == 0)
-                        cf_util_get_string (child, &cb->clientkeypass);
-                else if (strcasecmp ("SSLVersion", child->key) == 0)
-                {
-                        char *value = NULL;
-
-                        cf_util_get_string (child, &value);
-
-                        if (value == NULL || strcasecmp ("default", value) == 0)
-                                cb->sslversion = CURL_SSLVERSION_DEFAULT;
-                        else if (strcasecmp ("SSLv2", value) == 0)
-                                cb->sslversion = CURL_SSLVERSION_SSLv2;
-                        else if (strcasecmp ("SSLv3", value) == 0)
-                                cb->sslversion = CURL_SSLVERSION_SSLv3;
-                        else if (strcasecmp ("TLSv1", value) == 0)
-                                cb->sslversion = CURL_SSLVERSION_TLSv1;
-#if (LIBCURL_VERSION_MAJOR > 7) || (LIBCURL_VERSION_MAJOR == 7 && LIBCURL_VERSION_MINOR >= 34)
-                        else if (strcasecmp ("TLSv1_0", value) == 0)
-                                cb->sslversion = CURL_SSLVERSION_TLSv1_0;
-                        else if (strcasecmp ("TLSv1_1", value) == 0)
-                                cb->sslversion = CURL_SSLVERSION_TLSv1_1;
-                        else if (strcasecmp ("TLSv1_2", value) == 0)
-                                cb->sslversion = CURL_SSLVERSION_TLSv1_2;
-#endif
-                        else
-                                ERROR ("write_blueflood plugin: Invalid SSLVersion "
-                                                "option: %s.", value);
-
-                        sfree(value);
-                }
-                else if (strcasecmp ("Format", child->key) == 0)
-                        config_set_format (cb, child);
-                else if (strcasecmp ("StoreRates", child->key) == 0)
-                        cf_util_get_boolean (child, &cb->store_rates);
-                else if (strcasecmp ("BufferSize", child->key) == 0)
-                        cf_util_get_int (child, &buffer_size);
                 else
                 {
                         ERROR ("write_blueflood plugin: Invalid configuration "
